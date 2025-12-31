@@ -1,0 +1,5 @@
+{
+  "name": "Paradex Zero-Spread Monitor",
+  "description": "Real-time visualization of Paradex market spreads and liquidity depth, focusing on ultra-tight 0-0.001% spreads.",
+  "requestFramePermissions": []
+}
