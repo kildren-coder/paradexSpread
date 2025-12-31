@@ -115,8 +115,8 @@ const App: React.FC = () => {
               How it works
             </div>
             <p className="opacity-80 leading-relaxed">
-              Scanning for <span className="text-emerald-400 font-bold">Ultra-Tight Spreads (0-0.001%)</span>. 
-              Liquidity depth is calculated by aggregating order book volume strictly within 1 basis point deviation from the mid-price.
+              Scanning for <span className="text-emerald-400 font-bold">Ultra-Tight Spreads (0-0.001%)</span> via <span className="text-white">Paradex WebSocket</span>. 
+              Liquidity depth is calculated by aggregating real-time order book volume strictly within 1 basis point deviation from the mid-price.
             </p>
           </div>
         </div>
@@ -202,7 +202,7 @@ const App: React.FC = () => {
           </div>
           <div className="bg-slate-950 p-3 text-center text-xs text-slate-600 border-t border-slate-800">
             Note: "Depth @ 0.001%" represents aggregated volume within ±0.001% of the mid-price. 
-            This is simulated data for demonstration purposes as Paradex API requires server-side proxy for browser access.
+            Data source: Paradex WebSocket API.
           </div>
         </div>
       </main>

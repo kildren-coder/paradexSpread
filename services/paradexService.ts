@@ -96,7 +96,9 @@ class ParadexService {
   }
 
   private subscribeToMarkets() {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    // Capture ws in a local variable to satisfy TypeScript null checks inside the forEach callback
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
     this.symbols.forEach(symbol => {
       // Initialize local book storage
@@ -114,7 +116,7 @@ class ParadexService {
         },
         id: Date.now()
       };
-      this.ws.send(JSON.stringify(payload));
+      ws.send(JSON.stringify(payload));
     });
   }
 
