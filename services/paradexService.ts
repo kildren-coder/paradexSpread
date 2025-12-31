@@ -1,10 +1,12 @@
-import { MarketTicker, OrderBook, OrderLevel } from '../types';
+import { MarketTicker, OrderLevel } from '../types';
 
 // Configuration
 const PARADEX_WS_URL = 'wss://ws.api.prod.paradex.trade/v1';
+const PARADEX_API_URL = 'https://api.prod.paradex.trade/v1/markets';
 const TARGET_SPREAD_THRESHOLD = 0.00001; // 0.001% target
+const SEND_DELAY_MS = 50; // Delay between WS messages to prevent rate limiting
 
-// Default symbols if API fetch fails or for initial load
+// Default symbols to ensure app works even if API fetch fails
 const DEFAULT_SYMBOLS = [
   'BTC-USD-PERP', 'ETH-USD-PERP', 'SOL-USD-PERP', 
   'ARB-USD-PERP', 'DOGE-USD-PERP', 'SUI-USD-PERP', 
@@ -24,100 +26,184 @@ interface WsMessage {
 // Paradex raw order book format: [price, size] as strings
 type RawLevel = [string, string];
 
+export type ConnectionStatus = 'CONNECTING' | 'CONNECTED' | 'DISCONNECTED' | 'ERROR';
+
 class ParadexService {
   private ws: WebSocket | null = null;
   private subscribers: ((data: MarketTicker[]) => void)[] = [];
+  private statusSubscribers: ((status: ConnectionStatus) => void)[] = [];
   private localOrderBooks: Map<string, { bids: Map<number, number>; asks: Map<number, number> }> = new Map();
   private marketTickers: Map<string, MarketTicker> = new Map();
   private symbols: string[] = DEFAULT_SYMBOLS;
   private reconnectTimer: any = null;
-  private isConnecting: boolean = false;
+  private connectionStatus: ConnectionStatus = 'DISCONNECTED';
+  
+  // Message Queue for throttling
+  private messageQueue: string[] = [];
+  private isProcessingQueue: boolean = false;
+  private messageIdCounter: number = 0;
 
   constructor() {
     this.init();
   }
 
-  private async init() {
-    // 1. Try to fetch available markets (fallback to defaults if fails)
+  private init() {
+    // 1. Start connection IMMEDIATELY with default symbols.
+    this.connect();
+    // 2. Fetch full market list in background
+    this.fetchMarkets();
+  }
+
+  private async fetchMarkets() {
     try {
-      const response = await fetch('https://api.prod.paradex.trade/v1/markets');
-      if (response.ok) {
-        const json = await response.json();
-        // Filter for active PERP markets
-        this.symbols = json.results
+      console.log('Fetching markets from Paradex API...');
+      const response = await fetch(PARADEX_API_URL);
+      if (!response.ok) {
+        throw new Error(`API Error: ${response.status}`);
+      }
+      const json = await response.json();
+      
+      // Filter for active PERP markets
+      if (json.results && Array.isArray(json.results)) {
+        const newSymbols = json.results
           .filter((m: any) => m.symbol.endsWith('-PERP'))
           .map((m: any) => m.symbol)
-          .slice(0, 20); // Limit to top 20 to save bandwidth for this demo
+          .slice(0, 40); // Limit to top 40 to be safe with bandwidth
+
+        if (newSymbols.length > 0) {
+          console.log(`Fetched ${newSymbols.length} markets.`);
+          this.symbols = newSymbols;
+          // Subscribe to new symbols if connected
+          if (this.connectionStatus === 'CONNECTED') {
+            this.subscribeToMarkets();
+          }
+        }
       }
     } catch (e) {
-      console.warn('Failed to fetch markets list, using defaults', e);
+      console.warn('Failed to fetch markets list, keeping defaults.', e);
     }
+  }
 
-    // 2. Connect WS
-    this.connect();
+  private updateStatus(status: ConnectionStatus) {
+    if (this.connectionStatus !== status) {
+      this.connectionStatus = status;
+      this.statusSubscribers.forEach(cb => cb(status));
+    }
   }
 
   private connect() {
-    if (this.isConnecting || this.ws?.readyState === WebSocket.OPEN) return;
-    this.isConnecting = true;
+    if (this.connectionStatus === 'CONNECTED' || this.connectionStatus === 'CONNECTING') return;
+    
+    // Cleanup existing
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+    this.messageQueue = []; // Clear queue on reconnect
+    this.isProcessingQueue = false;
 
-    this.ws = new WebSocket(PARADEX_WS_URL);
+    this.updateStatus('CONNECTING');
+    console.log(`Connecting to ${PARADEX_WS_URL}...`);
 
-    this.ws.onopen = () => {
-      this.isConnecting = false;
-      console.log('Connected to Paradex WS');
-      this.subscribeToMarkets();
-    };
+    try {
+      this.ws = new WebSocket(PARADEX_WS_URL);
 
-    this.ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        this.handleMessage(msg);
-      } catch (e) {
-        console.error('Parse error', e);
-      }
-    };
+      this.ws.onopen = () => {
+        console.log('Paradex WS Connected');
+        this.updateStatus('CONNECTED');
+        this.subscribeToMarkets();
+      };
 
-    this.ws.onclose = () => {
-      this.isConnecting = false;
-      console.log('Paradex WS closed, reconnecting in 3s...');
+      this.ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          this.handleMessage(msg);
+        } catch (e) {
+          // ignore parse errors
+        }
+      };
+
+      this.ws.onclose = (event) => {
+        console.log(`Paradex WS closed (Code: ${event.code}, Reason: ${event.reason})`);
+        this.updateStatus('DISCONNECTED');
+        this.ws = null;
+        this.scheduleReconnect();
+      };
+
+      this.ws.onerror = (err) => {
+        console.error('Paradex WS error', err);
+        this.updateStatus('ERROR');
+      };
+    } catch (e) {
+      console.error('Failed to create WebSocket', e);
       this.scheduleReconnect();
-    };
-
-    this.ws.onerror = (err) => {
-      console.error('Paradex WS error', err);
-      this.ws?.close();
-    };
+    }
   }
 
   private scheduleReconnect() {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.reconnectTimer = setTimeout(() => this.connect(), 3000);
+    this.reconnectTimer = setTimeout(() => {
+      console.log('Attempting reconnect...');
+      this.connect();
+    }, 5000); // Increased to 5s to be nicer to the server
   }
 
   private subscribeToMarkets() {
-    // Capture ws in a local variable to satisfy TypeScript null checks inside the forEach callback
-    const ws = this.ws;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (this.connectionStatus !== 'CONNECTED') return;
 
+    console.log(`Queueing subscriptions for ${this.symbols.length} markets...`);
+    
     this.symbols.forEach(symbol => {
-      // Initialize local book storage
       if (!this.localOrderBooks.has(symbol)) {
         this.localOrderBooks.set(symbol, { bids: new Map(), asks: new Map() });
       }
 
-      // Send JSON-RPC subscribe
-      const payload = {
+      this.messageIdCounter++;
+      const payload = JSON.stringify({
         jsonrpc: "2.0",
         method: "subscribe",
         params: {
           channel: "order_book",
           market: symbol
         },
-        id: Date.now()
-      };
-      ws.send(JSON.stringify(payload));
+        id: this.messageIdCounter
+      });
+      
+      this.queueMessage(payload);
     });
+  }
+
+  // --- Message Queue Logic to prevent Rate Limiting ---
+  private queueMessage(message: string) {
+    this.messageQueue.push(message);
+    this.processQueue();
+  }
+
+  private processQueue() {
+    if (this.isProcessingQueue || this.messageQueue.length === 0) return;
+    
+    this.isProcessingQueue = true;
+    
+    const sendNext = () => {
+      if (this.messageQueue.length === 0 || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        this.isProcessingQueue = false;
+        return;
+      }
+
+      const msg = this.messageQueue.shift();
+      if (msg) {
+        try {
+          this.ws.send(msg);
+        } catch (e) {
+          console.error("Failed to send WS message", e);
+        }
+      }
+
+      // Schedule next send
+      setTimeout(sendNext, SEND_DELAY_MS);
+    };
+
+    sendNext();
   }
 
   private handleMessage(msg: WsMessage) {
@@ -131,8 +217,6 @@ class ParadexService {
     const book = this.localOrderBooks.get(symbol);
     if (!book) return;
 
-    // Helper to update the map
-    // If size is '0', delete the level. Otherwise set it.
     const updateLevels = (map: Map<number, number>, levels: RawLevel[]) => {
       levels.forEach(([priceStr, sizeStr]) => {
         const price = parseFloat(priceStr);
@@ -148,13 +232,13 @@ class ParadexService {
     updateLevels(book.bids, rawBids || []);
     updateLevels(book.asks, rawAsks || []);
 
-    // Convert Map to sorted Arrays for metrics calculation
-    // Bids: High to Low
+    // Optimization: Only recalculate/notify if it's a "Top of Book" change or large update?
+    // For now, we do it every time, but debouncing could be added here if UI lags.
+
     const sortedBids: OrderLevel[] = Array.from(book.bids.entries())
       .map(([price, size]) => ({ price, size }))
       .sort((a, b) => b.price - a.price);
 
-    // Asks: Low to High
     const sortedAsks: OrderLevel[] = Array.from(book.asks.entries())
       .map(([price, size]) => ({ price, size }))
       .sort((a, b) => a.price - b.price);
@@ -162,9 +246,6 @@ class ParadexService {
     if (sortedBids.length > 0 && sortedAsks.length > 0) {
       const ticker = this.calculateMetrics(symbol, sortedBids, sortedAsks);
       this.marketTickers.set(symbol, ticker);
-      
-      // Throttle updates to UI slightly to avoid React render spam? 
-      // For now, we just notify on every update. In high freq this might need a debounce.
       this.notify();
     }
   }
@@ -174,36 +255,28 @@ class ParadexService {
     const bestAsk = asks[0].price;
     const midPrice = (bestBid + bestAsk) / 2;
     
-    // Calculate raw spread
     const spread = bestAsk - bestBid;
-    const spreadPct = spread / bestBid; // using bestBid as denominator is standard
+    const spreadPct = spread / bestBid;
 
-    // Calculate liquidity STRICTLY within the 0.001% threshold relative to best price
-    // Range is defined as:
-    // Bid Side: [bestBid * (1 - 0.001%), bestBid]
-    // Ask Side: [bestAsk, bestAsk * (1 + 0.001%)]
-    
     const bidCutoff = bestBid * (1 - TARGET_SPREAD_THRESHOLD);
     const askCutoff = bestAsk * (1 + TARGET_SPREAD_THRESHOLD);
 
     let bidLiquidity = 0;
     let askLiquidity = 0;
 
-    // Sum bids down to cutoff
     for (const level of bids) {
       if (level.price >= bidCutoff) {
         bidLiquidity += level.size;
       } else {
-        break; // Sorted descending, so we can stop early
+        break;
       }
     }
 
-    // Sum asks up to cutoff
     for (const level of asks) {
       if (level.price <= askCutoff) {
         askLiquidity += level.size;
       } else {
-        break; // Sorted ascending, so we can stop early
+        break;
       }
     }
 
@@ -219,18 +292,25 @@ class ParadexService {
         askSide: askLiquidity,
         totalUsd: (bidLiquidity + askLiquidity) * midPrice
       },
-      volume24h: 0 // Not available in order_book channel, would need separate sub
+      volume24h: 0 
     };
   }
 
   public subscribe(callback: (data: MarketTicker[]) => void) {
     this.subscribers.push(callback);
-    // Immediately send current state if available
     if (this.marketTickers.size > 0) {
       callback(Array.from(this.marketTickers.values()));
     }
     return () => {
       this.subscribers = this.subscribers.filter(s => s !== callback);
+    };
+  }
+
+  public subscribeStatus(callback: (status: ConnectionStatus) => void) {
+    this.statusSubscribers.push(callback);
+    callback(this.connectionStatus);
+    return () => {
+      this.statusSubscribers = this.statusSubscribers.filter(s => s !== callback);
     };
   }
 

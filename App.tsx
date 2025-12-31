@@ -1,21 +1,32 @@
 import React, { useEffect, useState, useMemo } from 'react';
-import { Activity, ArrowUpRight, Filter, Info, ShieldCheck, Zap } from 'lucide-react';
-import { paradexService } from './services/paradexService';
+import { Filter, Info, ShieldCheck, Zap, Activity, Wifi, WifiOff, AlertTriangle } from 'lucide-react';
+import { paradexService, ConnectionStatus } from './services/paradexService';
 import { MarketTicker } from './types';
 import { SpreadIndicator } from './components/SpreadIndicator';
 import { LiquidityBar } from './components/LiquidityBar';
 
 const App: React.FC = () => {
   const [markets, setMarkets] = useState<MarketTicker[]>([]);
+  const [status, setStatus] = useState<ConnectionStatus>('CONNECTING');
   const [filterTightOnly, setFilterTightOnly] = useState(false);
-  const [isLoading, setIsLoading] = useState(true);
+  const [hasReceivedData, setHasReceivedData] = useState(false);
 
   useEffect(() => {
-    const unsubscribe = paradexService.subscribe((data) => {
+    // Data subscription
+    const unsubData = paradexService.subscribe((data) => {
       setMarkets(data);
-      setIsLoading(false);
+      if (data.length > 0) setHasReceivedData(true);
     });
-    return () => unsubscribe();
+
+    // Status subscription
+    const unsubStatus = paradexService.subscribeStatus((newStatus) => {
+      setStatus(newStatus);
+    });
+
+    return () => {
+      unsubData();
+      unsubStatus();
+    };
   }, []);
 
   const sortedMarkets = useMemo(() => {
@@ -25,7 +36,6 @@ const App: React.FC = () => {
     data.sort((a, b) => a.spreadPct - b.spreadPct);
 
     if (filterTightOnly) {
-      // Show only spreads <= 0.005% for the filter view
       data = data.filter(m => m.spreadPct <= 0.00005);
     }
     
@@ -33,6 +43,33 @@ const App: React.FC = () => {
   }, [markets, filterTightOnly]);
 
   const bestMarket = sortedMarkets[0];
+
+  // Render Helper: Status Badge
+  const renderStatusBadge = () => {
+    switch (status) {
+      case 'CONNECTED':
+        return (
+          <div className="flex items-center gap-2 px-3 py-1 bg-emerald-500/10 border border-emerald-500/20 rounded-full text-emerald-400 text-xs font-medium">
+            <Wifi className="w-3 h-3" />
+            <span>Connected</span>
+          </div>
+        );
+      case 'CONNECTING':
+        return (
+          <div className="flex items-center gap-2 px-3 py-1 bg-yellow-500/10 border border-yellow-500/20 rounded-full text-yellow-400 text-xs font-medium animate-pulse">
+            <Activity className="w-3 h-3" />
+            <span>Connecting...</span>
+          </div>
+        );
+      default:
+        return (
+          <div className="flex items-center gap-2 px-3 py-1 bg-rose-500/10 border border-rose-500/20 rounded-full text-rose-400 text-xs font-medium">
+            <WifiOff className="w-3 h-3" />
+            <span>Disconnected</span>
+          </div>
+        );
+    }
+  };
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-200 font-sans selection:bg-emerald-500/30">
@@ -44,15 +81,13 @@ const App: React.FC = () => {
               <Zap className="w-6 h-6 text-emerald-400" />
             </div>
             <div>
-              <h1 className="text-xl font-bold tracking-tight text-white">Paradex <span className="text-emerald-400">Scanner</span></h1>
-              <p className="text-xs text-slate-500 flex items-center gap-1">
-                <span className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></span>
-                Live Market Data
-              </p>
+              <h1 className="text-xl font-bold tracking-tight text-white hidden sm:block">Paradex <span className="text-emerald-400">Scanner</span></h1>
+              <h1 className="text-xl font-bold tracking-tight text-white sm:hidden">Paradex</h1>
             </div>
           </div>
           
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-3 sm:gap-4">
+            {renderStatusBadge()}
             <button 
               onClick={() => setFilterTightOnly(!filterTightOnly)}
               className={`flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium transition-all ${
@@ -62,7 +97,7 @@ const App: React.FC = () => {
               }`}
             >
               <Filter className="w-4 h-4" />
-              {filterTightOnly ? 'Showing Prime Only' : 'Show All Markets'}
+              <span className="hidden sm:inline">{filterTightOnly ? 'Showing Prime Only' : 'Show All Markets'}</span>
             </button>
           </div>
         </div>
@@ -70,6 +105,17 @@ const App: React.FC = () => {
 
       <main className="max-w-7xl mx-auto px-4 py-8 space-y-8">
         
+        {/* Status Alert if Disconnected */}
+        {status === 'DISCONNECTED' || status === 'ERROR' ? (
+          <div className="bg-rose-950/30 border border-rose-500/30 rounded-lg p-4 flex items-center gap-3 text-rose-200">
+            <AlertTriangle className="w-5 h-5 text-rose-500" />
+            <div>
+              <p className="font-medium">Connection Lost</p>
+              <p className="text-sm opacity-80">We are unable to reach Paradex servers. Attempting to reconnect automatically...</p>
+            </div>
+          </div>
+        ) : null}
+
         {/* Hero / Stats Area */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
           {/* Stat 1: Best Spread */}
@@ -80,21 +126,23 @@ const App: React.FC = () => {
             <h3 className="text-slate-500 text-sm font-medium mb-2">Tightest Market Spread</h3>
             {bestMarket ? (
               <div>
-                <div className="text-3xl font-bold text-white mb-1">{bestMarket.symbol}</div>
+                <div className="text-3xl font-bold text-white mb-1">{bestMarket.symbol.replace('-PERP', '')}</div>
                 <div className="flex items-center gap-2 text-emerald-400">
                   <span className="text-2xl font-mono">{(bestMarket.spreadPct * 100).toFixed(4)}%</span>
                   <span className="text-xs px-1.5 py-0.5 bg-emerald-500/10 rounded border border-emerald-500/20">PRIME</span>
                 </div>
               </div>
             ) : (
-              <div className="animate-pulse h-16 bg-slate-800 rounded"></div>
+              <div className={`h-16 flex items-center ${hasReceivedData ? '' : 'animate-pulse'}`}>
+                 {hasReceivedData ? <span className="text-slate-500">No data available</span> : <div className="h-8 w-32 bg-slate-800 rounded"></div>}
+              </div>
             )}
           </div>
 
           {/* Stat 2: Opportunity */}
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 relative overflow-hidden">
             <h3 className="text-slate-500 text-sm font-medium mb-2">Zero-Spread Liquidity</h3>
-             {bestMarket ? (
+             {hasReceivedData ? (
               <div>
                  <div className="text-3xl font-bold text-white mb-1">
                    {new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(
@@ -141,7 +189,7 @@ const App: React.FC = () => {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/50">
-                {isLoading ? (
+                {!hasReceivedData ? (
                   Array.from({ length: 5 }).map((_, i) => (
                     <tr key={i} className="animate-pulse">
                       <td className="p-4"><div className="h-4 w-24 bg-slate-800 rounded"></div></td>
